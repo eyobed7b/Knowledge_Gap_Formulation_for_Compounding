@@ -1,19 +1,7 @@
-# Morning Call Summary — Day 3
+# Morning Call Summary
 
-**Partners:** Eyobed Feleke (asker) + [Partner Name]  
-**Date:** 2026-05-07  
-**Duration:** 25 minutes  
+During the morning call, we clarified that the original draft question was mixing three related but different issues: SimPO β, the target reward margin, and the model’s PASS bias on disqualification tasks. The ambiguity was that the repo describes the model as SimPO-style, but the actual training script uses TRL `CPOTrainer` with `CPO_BETA = 2.0`, so the question needed to distinguish SimPO theory from the implemented CPO configuration.
 
----
+We sharpened the question around the concrete Week 11 artifact: `training/train_simpo.py` and the preference-pair construction in `training_data/build_simpo_pairs.py`. We agreed that the real gap is not simply “what is β?” but whether PASS bias should be solved by changing β, adding a SimPO-style target margin, or tuning the inference PASS threshold.
 
-The original draft question was too broad — it asked "what is the difference between JSON
-mode and tool-calling" without naming a specific failure the answer would fix. The partner
-pushed back: "You're asking a comparison question. What breaks in your system because you
-don't know the answer?" That interrogation surfaced the P-15 bug: `disqualified` is hardcoded
-to `False` in `icp_classifier.py` lines 119 and 136, and the question was really about
-whether fixing it requires switching the model to tool-calling (model-layer fix) or just
-adding a Python guard before `compose_outreach_email` is called (scaffolding-layer fix).
-The question was rewritten to be diagnostic: it now names the token-level mechanism as the
-load-bearing gap, because without understanding what the model generates differently under
-`tools` vs `response_format`, the asker cannot choose the right fix layer. Both partners
-confirmed the sharpened question is unambiguous and answerable in one explainer.
+The revised question now asks how preference-loss mechanics translate into false PASS behavior on disqualification tasks, and what diagnostic sweep would reduce that bias without damaging the judge’s overall calibration.

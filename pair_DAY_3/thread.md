@@ -5,79 +5,82 @@
 ---
 
 **Tweet 1**
-I called my Week 10 system an "agent." Then I found a bug where a hardcoded `False`
-meant disqualified prospects were getting outreach emails. To fix it, I had to understand
-something I'd been glossing over: what does the model actually *do* differently with
-`tools` vs `response_format: json_object`?
+My Week 11 compliance judge hit 92.7% overall accuracy — but had an 18% false-negative rate
+on disqualification tasks. It was passing emails it should have flagged.
 
-The answer changed how I thought about where bugs like this belong. 🧵
+I assumed β=2.0 was the problem. It wasn't the root cause. Here's what I learned about where
+PASS bias actually comes from. 🧵
 
 ---
 
 **Tweet 2**
-JSON mode (`response_format: json_object`) is a **constraint on output**, not a decision
-mechanism.
+β in the CPO/DPO loss is not a "strictness dial" for specific categories.
 
-The model generates tokens exactly as normal. The API just suppresses any token that would
-break valid JSON. The model never "chooses" anything — your scaffolding gets the JSON and
-decides what to do with it.
+The loss is:
+`L = -log σ( β · (log p(chosen) - log p(rejected)) )`
 
-Your Python code is making all the routing decisions.
+β is a global reward-scale knob. Higher β pulls the trained policy back toward the reference
+model's prior on *all* tasks. Raising it to fix disqualification recall risks degrading
+calibration everywhere else.
 
 ---
 
 **Tweet 3**
-Tool-calling is structurally different.
+The real root cause in my case was **output length asymmetry**.
 
-When you pass a `tools` parameter, the model sees your tool definitions in context and can
-generate a **tool-call token** instead of a text response:
+PASS verdicts in my training data averaged ~11 tokens.
+FAIL verdicts (with reasoning) averaged ~54 tokens.
 
-```
-{"type": "tool_use", "name": "suppress_prospect", "input": {...}}
-```
+Plain CPO uses total log-probability as the reward. Shorter sequences accumulate less
+negative log-prob — so PASS systematically looks like a better prediction than FAIL,
+regardless of content.
 
-The model chose that tool name as an output token. The API intercepts it. Your scaffolding
-never saw a JSON body — it saw a routing decision the model made.
+β didn't cause this. β can't fix it either.
 
 ---
 
 **Tweet 4**
-So which layer should own a disqualification routing decision?
+SimPO fixes this structurally — but only if you prepare the data first.
 
-The scaffolding — if the decision is rule-based and deterministic (classifier already has
-the answer).
+SimPO switches to **length-normalized reward** (average log-prob per token) and adds a
+**target margin γ** requiring chosen to beat rejected by at least γ, not just marginally.
 
-The model via tool-calling — if the decision requires reading context the classifier
-can't see (e.g., the prospect's reply email).
+But if you enable length normalization with a 4.9× length asymmetry still in the training
+pairs, the normalization amplifies the bias rather than correcting it.
 
-My P-15 bug was a scaffolding bug. One Python guard fixed it:
-
-```python
-if classification.disqualified:
-    return {"status": "suppressed"}
-```
-
-No tool-calling needed. No model latency added.
+Equalize output lengths in the pair builder *before* enabling SimPO.
 
 ---
 
 **Tweet 5**
-The insight that generalizes:
+The diagnostic order matters more than the fix itself.
 
-Tool-calling gives the model genuine branching agency — but only for decisions where the
-model has information the scaffolding doesn't.
+Cheapest first:
+1. Raise the inference threshold from 0.70 → 0.75 and re-score. If false-negative rate on
+   disqualification drops below 10%, no retraining needed.
+2. If not: equalize PASS/FAIL output lengths, then retrain with `loss_type="simpo"` and
+   `gamma_beta_ratio=0.4`.
+3. Only sweep β (try 1.0) if step 2 doesn't close the gap.
 
-For deterministic, safety-critical routing (disqualification, compliance suppression),
-scaffolding is cheaper, faster, and not subject to model hallucination.
-
-Knowing the difference is what separates a pipeline from an agent.
+A full retrain to test β first wastes compute if the threshold alone would have worked.
 
 ---
 
 **Tweet 6**
-Full explainer with the API call comparison, the Toolformer paper that established the
-mechanism, and the exact fix to the P-15 bug:
+The metric that makes this measurable:
+
+```python
+false_pass_rate = sum(
+    1 for r in results
+    if r.get("expected_pass") is False and r.get("passed") is True
+) / len(expected_fail_tasks)
+```
+
+Add this to your evaluator before claiming your judge works. Overall accuracy hides
+category-level failures.
+
+Full explainer with the CPO loss derivation, length asymmetry diagnosis, and SimPO config:
 
 [link to blog post]
 
-Sources: Schick et al. 2023 "Toolformer" (Meta AI) + Anthropic Tool Use docs.
+Sources: Rafailov et al. 2023 "DPO" (NeurIPS) + Meng et al. 2024 "SimPO" (NeurIPS).

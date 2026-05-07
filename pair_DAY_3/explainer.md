@@ -1,174 +1,166 @@
-# β, Length Normalization, and the Target Margin: Why Your SimPO Judge Has PASS Bias
+# Explainer: β, SimPO Margin, and Inference Threshold in Preference-Trained Judges
 
-*Written for a partner whose Week 11 judge (`train_simpo.py` using TRL CPOTrainer with
-CPO_BETA=2.0) shows PASS bias on disqualification tasks — and who needs to know whether
-the fix is tuning β, adding a SimPO target margin, or adjusting the inference threshold.*
-
----
-
-## The Question That Made This Worth Writing
-
-The partner's judge achieves 92.7% overall held-out accuracy but has an 18% false-negative
-rate on ICP disqualification tasks — it approves emails to prospects that should be
-suppressed. Three possible causes, three different fixes. The partner cannot choose between
-them because they do not understand what β actually controls in the preference loss, how
-length normalization changes the reward being compared, or what the SimPO target margin
-does differently from β. Without that, any config change is a guess.
+*Context: Week 11 `Sales-Evaluation-Bench-trp`. A judge model was trained on preference
+pairs to label sales conversation outcomes as `PASS` or `FAIL`. The script is named
+`train_simpo.py` but runs `CPOTrainer` with `CPO_BETA = 2.0` — no SimPO-specific config
+is applied. The held-out judge shows PASS bias on disqualification tasks. The question is
+whether this is a β problem, a missing SimPO target-margin problem, or an
+inference-threshold problem.*
 
 ---
 
-## The Load-Bearing Mechanism
+## The Setup
 
-**CPO (what the partner's trainer actually runs)** uses this loss:
+Training pairs for failing tasks are built as:
 
-```
-L_CPO = -log σ( β · (log p_θ(y_w) - log p_θ(y_l)) )
-```
+- `chosen` = correct `FAIL` verdict
+- `rejected` = over-generous `PASS` verdict
 
-β is the inverse temperature of the sigmoid. It scales the log-probability difference
-between chosen (`y_w`) and rejected (`y_l`) outputs before passing it through σ. Higher β
-→ the sigmoid responds more sharply to preference differences → larger gradient update when
-the model reverses preference. Lower β → softer boundary → the model can tolerate smaller
-gaps between chosen and rejected log-probabilities without a strong gradient correction.
-
-**SimPO** modifies CPO in two concrete ways:
-
-```
-L_SimPO = -log σ( β/|y_w| · Σlog p(y_w) − β/|y_l| · Σlog p(y_l) − γ )
-```
-
-**Change 1 — Length normalization (`/|y|`):** Instead of raw summed log-probability, SimPO
-divides by sequence length. This makes the reward comparable across outputs of different
-lengths. Without normalization, longer sequences accumulate lower total log-probability
-just by being longer, which systematically disadvantages them.
-
-**Change 2 — Target reward margin (γ):** The γ term requires that the chosen reward exceed
-the rejected reward by at least γ, not just beat it. It shifts the loss so the model is
-penalized not only when it reverses preference but also when it wins by too small a margin.
+The goal: teach the model that `FAIL` should outscore `PASS`. Overall held-out accuracy
+improved, but disqualification tasks still produce too many false PASSes. Three things
+could be responsible: the KL penalty β, the absence of a SimPO reward margin, or the
+inference PASS threshold in `scoring_evaluator.py`.
 
 ---
 
-## Why Length Normalization Is the Root Cause of PASS Bias
+## What β Controls in the Preference Loss
 
-Here is the critical asymmetry in the partner's training data:
+β is the **KL-divergence penalty**. It controls how far the trained policy is allowed to
+drift from the reference model during preference learning.
 
-- **PASS verdicts** are short: `{"verdict": "PASS"}` — roughly 8–15 tokens
-- **FAIL verdicts** include reasoning: `{"verdict": "FAIL", "reason": "email asserts hiring velocity without signal..."}` — roughly 40–80 tokens
+- **High β (e.g., 2.0):** The model is pulled back toward the reference at every update.
+  Strong prior behavior — such as a base model's tendency to be generous with PASS — is
+  hard to override. The `FAIL > PASS` preference signal competes against this pull and
+  may not win, especially on sparse categories like disqualification tasks.
+- **Low β (e.g., 0.5):** Larger updates are allowed. The preference signal is stronger,
+  but β too low risks collapsing calibration on the PASS tasks the judge already handles
+  correctly.
 
-Length-normalized reward = (1/|y|) × Σlog p(y)
-
-Per-token log-probability is always negative and typically higher (closer to zero) for
-shorter, more predictable sequences. A short PASS verdict has higher per-token log-prob
-than a long FAIL verdict with specific reasoning, because the model is more "confident"
-generating a short, generic token sequence.
-
-**Result:** After SimPO-style length normalization, PASS verdicts systematically receive
-higher length-normalized rewards than FAIL verdicts — even when the training pairs say FAIL
-is preferred. The length normalization that SimPO designed to fix one bias introduces
-another one when chosen and rejected outputs differ substantially in length.
-
-The partner's CPOTrainer does NOT apply length normalization (it uses raw log-prob), so
-this is not the current source of the bias. But it is the trap waiting if they switch to
-true SimPO loss without addressing output length.
+At `CPO_BETA = 2.0`, over-regularization is a plausible explanation for lingering PASS
+bias. Lowering β is the lowest-cost hypothesis to test: it requires only a config change
+and a retrain.
 
 ---
 
-## The Three Fixes, Diagnosed
+## CPO vs SimPO: Two Structural Gaps
 
-**Fix 1 — Tune β (raise it)**
+The script name implies SimPO but the config runs plain CPO. The two differ in exactly the
+ways that matter for disqualification bias.
 
-Higher β makes the gradient correction larger when the model reverses preference. On
-disqualification tasks, the model weakly prefers PASS over FAIL — raising β increases
-the force pushing it back toward FAIL on those pairs.
+### Gap 1 — Length-Normalized Reward
 
-*When to use:* If the chosen-vs-rejected log-prob gap on disqualification tasks is small
-but consistently in the wrong direction. Run this diagnostic:
+CPO computes rewards from **raw log probability**. A longer `PASS` response accumulates
+higher raw log probability than a shorter `FAIL` response purely because it has more
+tokens. This introduces a length bias that works against the preference signal: the model
+may learn to prefer verbose outputs rather than correct ones.
+
+SimPO uses **length-normalized average log probability** — total log probability divided
+by token count. Length stops being a confound. The model must learn quality differences
+between `FAIL` and `PASS`, not length differences.
+
+### Gap 2 — Target Reward Margin (γ)
+
+CPO only requires that `chosen` beats `rejected` by *any positive amount*, even 0.001.
+A model can satisfy this constraint while still producing nearly identical scores for
+`FAIL` and `PASS`. At inference time, a small score perturbation or a generous threshold
+is then enough to flip the prediction to PASS.
+
+SimPO adds a **target reward margin**: `chosen` must beat `rejected` by at least `γ/β`.
+This enforces a minimum separation robust enough to survive inference noise. For
+disqualification tasks — where the surface forms of `FAIL` and `PASS` verdicts may look
+similar — this margin is often the difference between the judge being reliable and not.
+
+The `gamma_beta_ratio` hyperparameter sets γ/β directly. A typical starting range is
+0.3–0.5.
+
+**Config change required:**
 
 ```python
-# In scoring_evaluator.py or a new diagnostic script
-for pair in disqualification_pairs:
-    log_p_chosen = model.score(pair["chosen"])   # FAIL verdict
-    log_p_rejected = model.score(pair["rejected"]) # PASS verdict
-    print(log_p_chosen - log_p_rejected)
-    # Negative values → model prefers PASS → β too low OR not enough data
-```
+# in train_simpo.py — current state
+trainer = CPOTrainer(
+    model=model,
+    args=CPOConfig(beta=2.0, ...),
+    ...
+)
 
-*Risk:* With only 137 training pairs, high β (>3.0) risks overfitting. The 84:53
-fail:pass ratio also means the model sees 1.6× more FAIL examples — class imbalance
-interacts with β in unpredictable ways at small N.
-
----
-
-**Fix 2 — Add SimPO target margin (switch `loss_type="simpo"`)**
-
-The margin γ ensures FAIL must beat PASS by at least γ in reward, not just marginally.
-In TRL this requires switching from CPOTrainer's default loss to SimPO:
-
-```python
-training_args = CPOConfig(
-    loss_type="simpo",        # enables SimPO loss
-    beta=2.0,                 # keep existing β
-    gamma_beta_ratio=0.3,     # γ = 0.3 × β = 0.6 — start here
+# target state
+trainer = CPOTrainer(
+    model=model,
+    args=CPOConfig(
+        beta=1.0,
+        loss_type="simpo",
+        gamma_beta_ratio=0.4,
+        ...
+    ),
     ...
 )
 ```
 
-`gamma_beta_ratio` sets γ as a multiple of β. A ratio of 0.3 means the model must prefer
-FAIL over PASS by a margin of 0.6 reward units. This is the SimPO paper's primary
-mechanism for reducing "near-tie" preference reversals.
+---
 
-*When to use:* If the diagnostic shows chosen-vs-rejected gaps are small but positive (FAIL
-is weakly preferred but not by enough). The margin pushes the model to hold FAIL more
-decisively.
+## The Inference Threshold Problem
 
-*Risk:* SimPO loss applies length normalization. Given the output length asymmetry (PASS
-shorter than FAIL), this may WORSEN the bias unless you also address output length.
-**Mitigation:** pad or truncate rejected PASS outputs to match chosen FAIL output length
-in `build_simpo_pairs.py`.
+Even a well-trained judge emits a continuous score. The threshold at which `scoring_evaluator.py`
+calls a score `PASS` vs `FAIL` is a post-hoc calibration decision, not a property of the
+model weights. If that threshold is too generous — or if the same value is applied uniformly
+across all task categories — disqualification tasks produce false PASSes regardless of how
+well the model was trained.
+
+This is the fastest hypothesis to test (no retrain required), but also the most dangerous
+to apply prematurely: raising the threshold on an under-trained model hides the root cause
+rather than resolving it.
 
 ---
 
-**Fix 3 — Adjust inference threshold (no retraining)**
+## Diagnostic Plan: How to Distinguish the Three
 
-The judge currently outputs a binary PASS/FAIL verdict from the model's top-1 token. If
-the model's output distribution shows low confidence on PASS predictions for
-disqualification tasks, raising the PASS confidence threshold is the cheapest fix:
+Run in this order:
 
-```python
-# In scoring_evaluator.py
-logits = model.get_logits(prompt)
-pass_prob = softmax(logits)[PASS_TOKEN_ID]
-verdict = "PASS" if pass_prob > 0.75 else "FAIL"  # raise threshold from 0.5
-```
+**Step 1 — Check reward margins on held-out disqualification pairs**
 
-*When to use:* If the model is genuinely uncertain on disqualification tasks — low
-confidence PASS predictions that could tip to FAIL with a higher threshold. This requires
-the judge to expose logits, not just top-1 output.
+Compute `chosen_reward − rejected_reward` for every disqualification pair in the held-out
+set. If the median margin is < 0.5, the model has not learned a robust `FAIL > PASS`
+separation. This points to β or missing SimPO margin — fix training first.
 
-*Risk:* This is calibration, not training. It does not fix the underlying preference
-misalignment; it compensates for it. Works as a fast diagnostic before committing to
-retraining.
+**Step 2 — Check per-category recall**
 
----
+Compare recall on `expected_pass=false` vs overall recall. If disqualification recall is
+disproportionately low while other categories hold, the threshold may be applying a
+uniform standard to a harder category. This opens the threshold hypothesis.
 
-## Concrete Diagnostic Plan
+**Step 3 — Retrain with SimPO config (hold β constant)**
 
-Run these in order — cheapest first:
+Add `loss_type="simpo"` and `gamma_beta_ratio=0.4`. If disqualification recall improves,
+the missing margin was the root cause.
 
-1. **Check output length distribution** in `build_simpo_pairs.py`: print `len(pair["chosen"].split())` vs `len(pair["rejected"].split())` for disqualification pairs. If PASS verdicts are >2× shorter, length bias is structural.
+**Step 4 — Retrain with lower β (hold everything else constant)**
 
-2. **Check confidence on held-out disqualification tasks**: extract logits for PASS vs FAIL token on the 10 disqualification-category tasks in `ablations/held_out_traces.jsonl`. If confidence on PASS is low (<0.65), threshold adjustment may be enough.
+Set β = 0.5. If disqualification recall improves without precision collapse on PASS tasks,
+β was over-regularizing.
 
-3. **Try threshold fix first**: raise PASS threshold to 0.70 in `scoring_evaluator.py`. Measure false-negative rate on disqualification tasks. If it drops below 10%, ship this.
+**Step 5 — Adjust threshold only if Steps 3–4 do not close the gap**
 
-4. **If threshold is insufficient**: retrain with `gamma_beta_ratio=0.3` using `loss_type="simpo"` in `train_simpo.py`. Equalize output lengths in training pairs first.
-
-5. **Update `hyperparameters.json`** with the chosen config and a one-sentence rationale for why β=2.0 + γ was chosen over β alone.
+Raise the PASS threshold specifically for `disqualification` category tasks in
+`scoring_evaluator.py`. Confirm that overall calibration on other categories does not
+degrade.
 
 ---
 
-## Pointers
+## Summary: Three Levers, One Ordering
 
-- **Meng et al. (2024), "SimPO: Simple Preference Optimization with a Reference-Free Reward"** (NeurIPS 2024) — primary source on the length-normalized reward and target margin mechanism. Section 3.2 is the load-bearing section.
-- **Rafailov et al. (2023), "Direct Preference Optimization"** (NeurIPS 2023) — original DPO paper; explains what β controls in the KL-constrained objective. CPO is a reference-free variant of DPO, so DPO's β analysis applies directly.
-- **Tool used:** Ran the diagnostic log-prob comparison on 10 disqualification-category pairs from `held_out_traces.jsonl`. Chosen (FAIL) log-prob was higher than rejected (PASS) on 7/10 pairs but by a margin of <0.3. This pattern — weak correct preference — is exactly what a higher β or a target margin is designed to strengthen.
+| Lever | Config location | When to pull it |
+|---|---|---|
+| Lower β | `hyperparameters.json` → `CPO_BETA` | Margins are small; model is over-regularized |
+| Add SimPO margin | `train_simpo.py` → `loss_type`, `gamma_beta_ratio` | Margins are small; length bias suspected |
+| Raise PASS threshold | `scoring_evaluator.py` | Training is correct; threshold is uniformly too generous |
+
+---
+
+## Artifacts
+
+- [training/train_simpo.py](training/train_simpo.py) — add `loss_type="simpo"`, `gamma_beta_ratio`, tune β
+- [training/hyperparameters.json](training/hyperparameters.json) — record final swept values
+- [training_data/build_simpo_pairs.py](training_data/build_simpo_pairs.py) — add more disqualification pairs if the category is data-sparse
+- [ablations/ablation_results.json](ablations/ablation_results.json) — log one ablation row per hypothesis
+- [scoring_evaluator.py](scoring_evaluator.py) — adjust PASS threshold only after confirming hypothesis 3
+- [memo.md](memo.md) — record decision and rationale

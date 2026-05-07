@@ -1,50 +1,17 @@
-# Grounding Commit — Day 3
+# Grounding Commit
 
-**Asker:** Eyobed Feleke  
-**Commit:** [b5473fe — docs: ground Week 12 Day 3 gap — CPO β mechanics and PASS bias diagnosis](https://github.com/eyobed7b/Sales-Evaluation-Bench-trp/commit/b5473fe)  
-**Artifacts edited:**
-- `week11/Sales-Evaluation-Bench-trp/training/train_simpo.py`
-- `week11/Sales-Evaluation-Bench-trp/training/hyperparameters.json`
-- `week11/Sales-Evaluation-Bench-trp/scoring_evaluator.py`
-- `week11/Sales-Evaluation-Bench-trp/memo.md`
+## Pointer to actual edit
 
----
+I grounded my peer’s explainer in my Week 11 Tenacious-Bench repo through three documentation commits:
 
-## What Changed
+1. [docs: add peer explainer blog](https://github.com/nuhaminae/The-Conversion-Engine-Ground-Truth/commit/f2cb19c2b0d684886dff856a3aa5af2a50e44aa4)  
+2. [docs: update model card with peer explanation](https://github.com/nuhaminae/The-Conversion-Engine-Ground-Truth/commit/2824b15a2af4d877b542af819fd448fad53049b8)  
+3. [docs(report): update decision memo with peer explanation section](https://github.com/nuhaminae/The-Conversion-Engine-Ground-Truth/commit/1f33433262c697459b9029350da21e284888b9fa)
 
-**train_simpo.py** — added a 20-line comment block above `CPO_BETA = 2.0` explaining
-what β controls (preference-pressure scalar, global reward-scale knob affecting all pairs),
-why β=2.0 may over-regularize on sparse disqualification pairs, and the output-length
-asymmetry warning (PASS ~11 tokens, FAIL ~54 tokens) that must be addressed before
-enabling `loss_type="simpo"`. Added the next-run sweep config as commented-out code:
+## What changed and why
 
-```python
-# config = CPOConfig(beta=1.0, loss_type="simpo", gamma_beta_ratio=0.4, ...)
-```
+I updated my Week 11 documentation to reflect my peer’s explanation of what DPO changed compared with prompting. Before this grounding edit, my report mainly stated the metric result: the prompt-engineered judge reached 76.92% strict pairwise accuracy, while the DPO judge reached 96.15%. After the edit, the result is interpreted mechanistically: prompting kept the Tenacious rubric in the model’s context window, but left the base model’s internal accept/reject boundary unchanged; DPO moved the preference signal into the LoRA adapter weights by training on `prompt/chosen/rejected` pairs and using chosen-vs-rejected log-prob margins against a frosen reference model. The model card and decision memo now frame the improvement as a likely decision-boundary and calibration shift, while still acknowledging that small-data overfitting or benchmark-style memorisation remains a risk that should be tested with train/dev reward margins, held-out margin distributions, per-source-mode accuracy, failed-pair inspection, threshold sweeps, and same-base prompted comparison.
 
-**hyperparameters.json** — added `beta_rationale`, `loss_type_note`, and a
-`simpo_next_run` block documenting the prerequisite output-length equalization step and
-the proposed next config (`beta=1.0`, `loss_type="simpo"`, `gamma_beta_ratio=0.4`).
+## Why this grounds the gap
 
-**scoring_evaluator.py** — added two new fields to `summary_stats()`:
-- `false_pass_rate_on_expected_fail` — fraction of expected-fail tasks the judge
-  incorrectly passed; the primary PASS bias metric
-- `category_recall_on_expected_fail` — per-category breakdown, enabling comparison
-  of ICP misclassification recall against other failure categories
-
-**memo.md** — replaced the vague "PASS bias on ICP misclassification tasks is unresolved"
-statement with a mechanistic explanation of two root causes (output-length asymmetry under
-raw log-prob reward; β over-regularization on sparse disqualification pairs) and a
-four-step diagnostic plan: threshold sweep first, then SimPO loss with length equalization,
-then β sweep only if needed.
-
-## Why These Changes
-
-Before reading the peer's explainer, the PASS bias was listed as a known limitation
-without a mechanism or a fix path. I knew β=2.0 was the config but could not say what β
-physically controls, why the length asymmetry matters, or which lever to pull first. After
-understanding that β is a global reward-scale knob and that CPO's raw log-prob reward
-creates a structural length confound, every artifact could be updated with a specific,
-testable claim. The `scoring_evaluator.py` change is the most immediately useful: it adds
-the per-category false-PASS diagnostic that was missing and turns the PASS bias from a
-reported observation into a measurable, attributable metric.
+My original gap was that I could report “DPO beat prompting,” but I could not explain what changed inside the model behavior. These edits turn that result from a simple leaderboard claim into a post-training interpretation: the DPO judge did not necessarily learn a completely new Tenacious-specific reasoning ability from 65 pairs; more plausibly, it calibrated an already capable base model by moving the acceptable-vs-bad decision boundary into the adapter weights. This makes the Week 11 artifact stronger because the model card and decision memo now state both the mechanism I understand and the empirical checks still needed before claiming full generalisation.

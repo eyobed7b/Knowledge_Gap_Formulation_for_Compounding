@@ -1,23 +1,7 @@
-# Sign-Off — Day 3
+**Asker:** Nuhamin Alemayehu
 
-**Asker:** Eyobed Feleke  
-**Gap closure status:** CLOSED  
+**Gap closure status:** Partially closed.
 
----
+**What I understand now that I didn't before:**
 
-Before reading the explainer I could not distinguish between what `response_format:
-json_object` and the `tools` parameter actually cause the model to do differently at the
-token level. I was using both terms interchangeably in my README and memo, and I had no
-basis for deciding whether the P-15 disqualification bug required a model-layer fix or a
-scaffolding-layer fix. I would have reached for tool-calling because it sounded more
-"agentic" — adding latency and cost to a decision the rule-based classifier already makes
-correctly.
-
-After reading the explainer, I understand that JSON mode constrains output format without
-changing the model's generation process or giving it any routing capability, while
-tool-calling injects tool definitions into the model's context and allows it to generate a
-tool-name token as a first-class routing decision. The distinction clarifies exactly when
-each mechanism is appropriate: tool-calling belongs on decisions where the model has
-context the scaffolding cannot access; scaffolding guards belong on deterministic
-rule-based decisions. P-15 is the second kind. I can now defend the one-line Python fix to
-a senior engineer and explain why it is the correct layer — not a shortcut.
+The gap is partially closed because I now understand the main mechanism my peer identified: prompting keeps the rubric in the context window, while DPO changes the adapter weights so the model’s preference boundary moves toward the `chosen` examples and away from the `rejected` examples. I also understand that the reference model in DPO acts as a regulariser and that the chosen-minus-rejected log-prob margin is the training signal that prompting alone cannot create. What is not fully closed yet is the empirical attribution: the explainer gives a strong hypothesis that the 76.92% → 96.15% improvement came mostly from decision-boundary shift and calibration improvement, but I still need to run the proposed diagnostics — train/dev reward margins, held-out margin distribution, per-source-mode accuracy, failed-pair inspection, and threshold sweeps — before I can rule out benchmark-style memorisation or overfitting.
