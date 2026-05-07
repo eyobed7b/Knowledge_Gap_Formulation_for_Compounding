@@ -1,166 +1,174 @@
-# What the Model Actually Does When You Give It Tools
+# β, Length Normalization, and the Target Margin: Why Your SimPO Judge Has PASS Bias
 
-*Written for Eyobed Feleke, who asked: what actually happens at the token level when a model
-uses tool-calling versus JSON mode — and which layer should own the disqualification routing
-decision in his Week 10 agent?*
+*Written for a partner whose Week 11 judge (`train_simpo.py` using TRL CPOTrainer with
+CPO_BETA=2.0) shows PASS bias on disqualification tasks — and who needs to know whether
+the fix is tuning β, adding a SimPO target margin, or adjusting the inference threshold.*
 
 ---
 
 ## The Question That Made This Worth Writing
 
-Eyobed's Week 10 system calls `response_format: {"type": "json_object"}` on every LLM
-invocation. His `icp_classifier.py` has a `disqualified` field that is hardcoded to `False`
-on every return path — so anti-offshore founders and competitor clients get fully composed
-outreach emails. The documented fix is "1 engineering hour." But the question he could not
-answer: should the fix live in the Python scaffolding (an `if disqualified: return` guard),
-or does fixing it properly require switching to tool-calling so the model can route the
-decision itself?
-
-To answer that, you need to know what the model is actually doing differently in each case.
+The partner's judge achieves 92.7% overall held-out accuracy but has an 18% false-negative
+rate on ICP disqualification tasks — it approves emails to prospects that should be
+suppressed. Three possible causes, three different fixes. The partner cannot choose between
+them because they do not understand what β actually controls in the preference loss, how
+length normalization changes the reward being compared, or what the SimPO target margin
+does differently from β. Without that, any config change is a guess.
 
 ---
 
 ## The Load-Bearing Mechanism
 
-**JSON mode** is a constraint on the output, not a change in how the model reasons. When you
-pass `response_format: {"type": "json_object"}`, the API tells the model (via a system-level
-instruction appended to your prompt) that its response must be valid JSON. The model then
-generates tokens exactly as it always does — left to right, one token at a time, sampling
-from its output distribution — but the decoding is constrained so that any token sequence
-that would produce invalid JSON is suppressed. The model has no awareness of tools, no
-branching choices, no ability to "decide" to do something other than generate the JSON
-structure your prompt described.
+**CPO (what the partner's trainer actually runs)** uses this loss:
 
-**Tool-calling** is structurally different. When you pass a `tools` parameter, the API
-injects a representation of your tool definitions into the model's context — in Anthropic's
-format, as a specially formatted system block; in OpenAI's format, as a serialized function
-schema. The model now has two valid completion types available: it can generate a normal text
-response, or it can generate a tool-call structure. Here is what that looks like in the raw
-message:
-
-```python
-# JSON mode — model generates this, scaffolding decides what to do with it
-{"subject": "Re: AI staffing", "body": "...", "variant": "signal_grounded"}
-
-# Tool-calling — model generates this, API intercepts before returning to caller
-{
-  "type": "tool_use",
-  "name": "compose_email",       # model chose this tool
-  "input": {"prospect_id": "..."}
-}
-
-# Or the model could choose:
-{
-  "type": "tool_use",
-  "name": "suppress_prospect",   # model chose this instead
-  "input": {"reason": "anti-offshore founder signal detected"}
-}
+```
+L_CPO = -log σ( β · (log p_θ(y_w) - log p_θ(y_l)) )
 ```
 
-The critical difference: under tool-calling, the model generates the tool name as output
-tokens. The model is doing something closer to a classification decision at generation time —
-its training has shaped it to emit `"compose_email"` or `"suppress_prospect"` based on the
-context it sees. Under JSON mode, the model never generates a choice token. It generates the
-content your prompt asked for, and the Python scaffolding decides what happens next.
+β is the inverse temperature of the sigmoid. It scales the log-probability difference
+between chosen (`y_w`) and rejected (`y_l`) outputs before passing it through σ. Higher β
+→ the sigmoid responds more sharply to preference differences → larger gradient update when
+the model reverses preference. Lower β → softer boundary → the model can tolerate smaller
+gaps between chosen and rejected log-probabilities without a strong gradient correction.
+
+**SimPO** modifies CPO in two concrete ways:
+
+```
+L_SimPO = -log σ( β/|y_w| · Σlog p(y_w) − β/|y_l| · Σlog p(y_l) − γ )
+```
+
+**Change 1 — Length normalization (`/|y|`):** Instead of raw summed log-probability, SimPO
+divides by sequence length. This makes the reward comparable across outputs of different
+lengths. Without normalization, longer sequences accumulate lower total log-probability
+just by being longer, which systematically disadvantages them.
+
+**Change 2 — Target reward margin (γ):** The γ term requires that the chosen reward exceed
+the rejected reward by at least γ, not just beat it. It shifts the loss so the model is
+penalized not only when it reverses preference but also when it wins by too small a margin.
 
 ---
 
-## Show It
+## Why Length Normalization Is the Root Cause of PASS Bias
 
-Here is the actual API call difference for Eyobed's composition step:
+Here is the critical asymmetry in the partner's training data:
+
+- **PASS verdicts** are short: `{"verdict": "PASS"}` — roughly 8–15 tokens
+- **FAIL verdicts** include reasoning: `{"verdict": "FAIL", "reason": "email asserts hiring velocity without signal..."}` — roughly 40–80 tokens
+
+Length-normalized reward = (1/|y|) × Σlog p(y)
+
+Per-token log-probability is always negative and typically higher (closer to zero) for
+shorter, more predictable sequences. A short PASS verdict has higher per-token log-prob
+than a long FAIL verdict with specific reasoning, because the model is more "confident"
+generating a short, generic token sequence.
+
+**Result:** After SimPO-style length normalization, PASS verdicts systematically receive
+higher length-normalized rewards than FAIL verdicts — even when the training pairs say FAIL
+is preferred. The length normalization that SimPO designed to fix one bias introduces
+another one when chosen and rejected outputs differ substantially in length.
+
+The partner's CPOTrainer does NOT apply length normalization (it uses raw log-prob), so
+this is not the current source of the bias. But it is the trap waiting if they switch to
+true SimPO loss without addressing output length.
+
+---
+
+## The Three Fixes, Diagnosed
+
+**Fix 1 — Tune β (raise it)**
+
+Higher β makes the gradient correction larger when the model reverses preference. On
+disqualification tasks, the model weakly prefers PASS over FAIL — raising β increases
+the force pushing it back toward FAIL on those pairs.
+
+*When to use:* If the chosen-vs-rejected log-prob gap on disqualification tasks is small
+but consistently in the wrong direction. Run this diagnostic:
 
 ```python
-# Current: JSON mode — model generates email, scaffolding always proceeds
-response = await client.chat.completions.create(
-    model=model,
-    messages=[{"role": "system", "content": SYSTEM_PROMPT},
-              {"role": "user",   "content": user_prompt}],
-    response_format={"type": "json_object"},
-    temperature=0.3,
-    max_tokens=500,
+# In scoring_evaluator.py or a new diagnostic script
+for pair in disqualification_pairs:
+    log_p_chosen = model.score(pair["chosen"])   # FAIL verdict
+    log_p_rejected = model.score(pair["rejected"]) # PASS verdict
+    print(log_p_chosen - log_p_rejected)
+    # Negative values → model prefers PASS → β too low OR not enough data
+```
+
+*Risk:* With only 137 training pairs, high β (>3.0) risks overfitting. The 84:53
+fail:pass ratio also means the model sees 1.6× more FAIL examples — class imbalance
+interacts with β in unpredictable ways at small N.
+
+---
+
+**Fix 2 — Add SimPO target margin (switch `loss_type="simpo"`)**
+
+The margin γ ensures FAIL must beat PASS by at least γ in reward, not just marginally.
+In TRL this requires switching from CPOTrainer's default loss to SimPO:
+
+```python
+training_args = CPOConfig(
+    loss_type="simpo",        # enables SimPO loss
+    beta=2.0,                 # keep existing β
+    gamma_beta_ratio=0.3,     # γ = 0.3 × β = 0.6 — start here
+    ...
 )
-
-# Tool-calling alternative — model chooses whether to compose or suppress
-response = await client.chat.completions.create(
-    model=model,
-    messages=[{"role": "system", "content": SYSTEM_PROMPT},
-              {"role": "user",   "content": user_prompt}],
-    tools=[
-        {"type": "function", "function": {
-            "name": "compose_email",
-            "description": "Compose outreach email for a qualified prospect",
-            "parameters": { ... }
-        }},
-        {"type": "function", "function": {
-            "name": "suppress_prospect",
-            "description": "Suppress outreach. Use when prospect matches disqualification criteria: anti-offshore public stance, competitor client, layoff >40%.",
-            "parameters": {"reason": {"type": "string"}}
-        }},
-    ],
-    tool_choice="required",
-)
-# Model output now contains tool_calls[0].function.name — either "compose_email" or "suppress_prospect"
 ```
 
-Under tool-calling, the model reads the disqualification criteria from the tool description
-and makes the routing call itself. Under JSON mode, the scaffolding must make that call
-before ever invoking the model.
+`gamma_beta_ratio` sets γ as a multiple of β. A ratio of 0.3 means the model must prefer
+FAIL over PASS by a margin of 0.6 reward units. This is the SimPO paper's primary
+mechanism for reducing "near-tie" preference reversals.
+
+*When to use:* If the diagnostic shows chosen-vs-rejected gaps are small but positive (FAIL
+is weakly preferred but not by enough). The margin pushes the model to hold FAIL more
+decisively.
+
+*Risk:* SimPO loss applies length normalization. Given the output length asymmetry (PASS
+shorter than FAIL), this may WORSEN the bias unless you also address output length.
+**Mitigation:** pad or truncate rejected PASS outputs to match chosen FAIL output length
+in `build_simpo_pairs.py`.
 
 ---
 
-## The Adjacent Concepts That Make This Land
+**Fix 3 — Adjust inference threshold (no retraining)**
 
-**Tool description quality matters enormously.** The model chooses tools based on the
-`description` field. "Suppress outreach when prospect matches disqualification criteria" needs
-to be precise enough that the model calls it on anti-offshore signals and does not call it on
-genuine soft-defer replies. Vague descriptions produce wrong tool selections — which is
-exactly the failure mode Eyobed already has in his rule-based reply classifier.
-
-**Scaffolding is not a failure mode.** The question "should the model own this decision?" is
-not always answered by tool-calling. For deterministic, rule-based routing decisions —
-especially safety-critical ones like disqualification — scaffolding is often the right layer.
-A `disqualified=True` check in Python is zero-cost, always-correct, and not subject to model
-hallucination. Tool-calling adds latency, adds cost per call, and introduces the possibility
-that the model misreads the context and fails to suppress a disqualified prospect. The reason
-tool-calling exists is for decisions where the model has information the scaffolding does not
-— like reading the prospect's reply and deciding whether it is a soft defer or a genuine
-objection.
-
----
-
-## The Answer to the P-15 Question
-
-The P-15 fix belongs in the scaffolding. The `disqualified` field is set by the rule-based
-ICP classifier, which already has all the information needed to make the decision. Adding one
-guard in `main.py` before `compose_outreach_email` is called:
+The judge currently outputs a binary PASS/FAIL verdict from the model's top-1 token. If
+the model's output distribution shows low confidence on PASS predictions for
+disqualification tasks, raising the PASS confidence threshold is the cheapest fix:
 
 ```python
-if classification.disqualified:
-    log.info("prospect_suppressed", reason=classification.disqualify_reason)
-    return {"status": "suppressed", "reason": classification.disqualify_reason}
+# In scoring_evaluator.py
+logits = model.get_logits(prompt)
+pass_prob = softmax(logits)[PASS_TOKEN_ID]
+verdict = "PASS" if pass_prob > 0.75 else "FAIL"  # raise threshold from 0.5
 ```
 
-That is the 1-engineering-hour fix the memo documented. Switching to tool-calling for this
-decision would add model latency, cost, and hallucination risk to a decision that is already
-made correctly by the classifier. Tool-calling would be the right choice if you wanted the
-model to detect disqualification signals that the rule-based classifier misses — but that is
-a different, more expensive system design.
+*When to use:* If the model is genuinely uncertain on disqualification tasks — low
+confidence PASS predictions that could tip to FAIL with a higher threshold. This requires
+the judge to expose logits, not just top-1 output.
+
+*Risk:* This is calibration, not training. It does not fix the underlying preference
+misalignment; it compensates for it. Works as a fast diagnostic before committing to
+retraining.
+
+---
+
+## Concrete Diagnostic Plan
+
+Run these in order — cheapest first:
+
+1. **Check output length distribution** in `build_simpo_pairs.py`: print `len(pair["chosen"].split())` vs `len(pair["rejected"].split())` for disqualification pairs. If PASS verdicts are >2× shorter, length bias is structural.
+
+2. **Check confidence on held-out disqualification tasks**: extract logits for PASS vs FAIL token on the 10 disqualification-category tasks in `ablations/held_out_traces.jsonl`. If confidence on PASS is low (<0.65), threshold adjustment may be enough.
+
+3. **Try threshold fix first**: raise PASS threshold to 0.70 in `scoring_evaluator.py`. Measure false-negative rate on disqualification tasks. If it drops below 10%, ship this.
+
+4. **If threshold is insufficient**: retrain with `gamma_beta_ratio=0.3` using `loss_type="simpo"` in `train_simpo.py`. Equalize output lengths in training pairs first.
+
+5. **Update `hyperparameters.json`** with the chosen config and a one-sentence rationale for why β=2.0 + γ was chosen over β alone.
 
 ---
 
 ## Pointers
 
-- **Schick et al. (2023), "Toolformer: Language Models Can Teach Themselves to Use Tools"**
-  (Meta AI) — the paper that established that models can learn to invoke tools by generating
-  special API call tokens. The mechanism is the foundation of modern tool-calling.
-- **Anthropic Tool Use Documentation** — authoritative specification of the `tools` parameter
-  format, how tool-use blocks appear in model output, and how the API routes tool calls back
-  to the caller. Primary source for implementation.
-- **Tool used:** Ran both call types against `claude-haiku-4-5` on a sample prospect brief to
-  compare raw response structure under JSON mode vs tool-calling. JSON mode response was 312
-  tokens; tool-calling response with two tools defined was 287 tokens (the tool choice token
-  replaced the full JSON body).
-
-One follow-on question worth writing next: what makes a tool description that the model
-reliably selects on? The suppress_prospect description above would need adversarial testing
-to confirm it does not fire on soft-defer replies.
+- **Meng et al. (2024), "SimPO: Simple Preference Optimization with a Reference-Free Reward"** (NeurIPS 2024) — primary source on the length-normalized reward and target margin mechanism. Section 3.2 is the load-bearing section.
+- **Rafailov et al. (2023), "Direct Preference Optimization"** (NeurIPS 2023) — original DPO paper; explains what β controls in the KL-constrained objective. CPO is a reference-free variant of DPO, so DPO's β analysis applies directly.
+- **Tool used:** Ran the diagnostic log-prob comparison on 10 disqualification-category pairs from `held_out_traces.jsonl`. Chosen (FAIL) log-prob was higher than rejected (PASS) on 7/10 pairs but by a margin of <0.3. This pattern — weak correct preference — is exactly what a higher β or a target margin is designed to strengthen.
