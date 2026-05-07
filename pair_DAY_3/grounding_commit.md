@@ -1,46 +1,50 @@
 # Grounding Commit — Day 3
 
 **Asker:** Eyobed Feleke  
-**Artifact edited:** `week10/Automated_Lead_Generation_and_Conversion_System/agent/qualification/icp_classifier.py`  
-**Secondary edit:** `week10/Automated_Lead_Generation_and_Conversion_System/agent/main.py`  
+**Commit:** [b5473fe — docs: ground Week 12 Day 3 gap — CPO β mechanics and PASS bias diagnosis](https://github.com/eyobed7b/Sales-Evaluation-Bench-trp/commit/b5473fe)  
+**Artifacts edited:**
+- `week11/Sales-Evaluation-Bench-trp/training/train_simpo.py`
+- `week11/Sales-Evaluation-Bench-trp/training/hyperparameters.json`
+- `week11/Sales-Evaluation-Bench-trp/scoring_evaluator.py`
+- `week11/Sales-Evaluation-Bench-trp/memo.md`
 
 ---
 
 ## What Changed
 
-Added the disqualification guard that fixes bug P-15. In `icp_classifier.py`, removed the
-hardcoded `disqualified=False` from both return paths (lines 119 and 136) and replaced them
-with actual evaluation logic against the documented disqualification criteria from
-`seed/icp_definition.md` (anti-offshore founder public stance, competitor client, layoff
->40%). In `main.py`, added an early-return guard immediately after ICP classification:
+**train_simpo.py** — added a 20-line comment block above `CPO_BETA = 2.0` explaining
+what β controls (preference-pressure scalar, global reward-scale knob affecting all pairs),
+why β=2.0 may over-regularize on sparse disqualification pairs, and the output-length
+asymmetry warning (PASS ~11 tokens, FAIL ~54 tokens) that must be addressed before
+enabling `loss_type="simpo"`. Added the next-run sweep config as commented-out code:
 
 ```python
-if classification.disqualified:
-    log.info(
-        "prospect_suppressed",
-        company=req.company_name,
-        reason=classification.disqualify_reason,
-    )
-    await upsert_contact(
-        email=req.contact_email or settings.staff_sink_email,
-        name=req.contact_name or req.company_name,
-        company=req.company_name,
-        properties={"icp_segment": "disqualified",
-                    "disqualify_reason": classification.disqualify_reason},
-        settings=settings,
-    )
-    return {"status": "suppressed", "reason": classification.disqualify_reason}
+# config = CPOConfig(beta=1.0, loss_type="simpo", gamma_beta_ratio=0.4, ...)
 ```
 
-## Why This Layer
+**hyperparameters.json** — added `beta_rationale`, `loss_type_note`, and a
+`simpo_next_run` block documenting the prerequisite output-length equalization step and
+the proposed next config (`beta=1.0`, `loss_type="simpo"`, `gamma_beta_ratio=0.4`).
 
-The fix lives in the scaffolding, not the model, because the disqualification decision is
-already made correctly by the rule-based ICP classifier — the classifier has all the signal
-data it needs. Switching to tool-calling would have added per-call model latency (~5–15s),
-additional token cost (~$0.0005/call), and introduced the possibility of the model
-hallucinating a suppress or compose decision based on ambiguous context. Understanding the
-token-level difference between tool-calling and JSON mode from the Day 3 explainer made
-this choice clear: tool-calling gives the model routing agency on decisions the scaffolding
-cannot make; this is not one of those decisions. The memo's "Known Limitations" section
-was also updated to remove P-15 from the unresolved list and document the fix layer with
-this rationale.
+**scoring_evaluator.py** — added two new fields to `summary_stats()`:
+- `false_pass_rate_on_expected_fail` — fraction of expected-fail tasks the judge
+  incorrectly passed; the primary PASS bias metric
+- `category_recall_on_expected_fail` — per-category breakdown, enabling comparison
+  of ICP misclassification recall against other failure categories
+
+**memo.md** — replaced the vague "PASS bias on ICP misclassification tasks is unresolved"
+statement with a mechanistic explanation of two root causes (output-length asymmetry under
+raw log-prob reward; β over-regularization on sparse disqualification pairs) and a
+four-step diagnostic plan: threshold sweep first, then SimPO loss with length equalization,
+then β sweep only if needed.
+
+## Why These Changes
+
+Before reading the peer's explainer, the PASS bias was listed as a known limitation
+without a mechanism or a fix path. I knew β=2.0 was the config but could not say what β
+physically controls, why the length asymmetry matters, or which lever to pull first. After
+understanding that β is a global reward-scale knob and that CPO's raw log-prob reward
+creates a structural length confound, every artifact could be updated with a specific,
+testable claim. The `scoring_evaluator.py` change is the most immediately useful: it adds
+the per-category false-PASS diagnostic that was missing and turns the PASS bias from a
+reported observation into a measurable, attributable metric.
