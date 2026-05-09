@@ -13,10 +13,11 @@ This repository documents four days of structured knowledge gap formulation work
 ## Repository Structure
 
 ```
-├── pair_DAY_1/          # Inference-time mechanics (prefill vs decode, latency)
-├── pair_DAY_2/          # Agent and tool-use internals (multi-turn context)
-├── pair_DAY_3/          # Training and post-training mechanics (β, SimPO, threshold)
-├── pair_DAY_4/          # Evaluation and statistics (Wilson CI, calibration, kappa)
+├── pair_DAY_N/
+│   ├── pair_DAY_1/      # Inference-time mechanics (prefill vs decode, latency)
+│   ├── pair_DAY_2/      # Agent and tool-use internals (multi-turn context)
+│   ├── pair_DAY_3/      # Training and post-training mechanics (β, SimPO, threshold)
+│   └── pair_DAY_4/      # Evaluation and statistics (Wilson CI, calibration, kappa)
 ├── capstone/            # Week 12 client delivery simulation — Horizon Services Group
 │   ├── part1_problem_framing.md
 │   ├── part2_ai_system_proposal.md
